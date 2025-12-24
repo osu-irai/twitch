@@ -1,8 +1,10 @@
-use eyre::{Context, Result, bail};
+use eyre::{Context, OptionExt, Result, bail};
 use futures::{FutureExt, StreamExt, stream::SplitStream};
+use lapin::protocol::metadata;
 use reqwest::Client;
 use std::{
     collections::HashMap,
+    panic,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -20,10 +22,12 @@ use tokio_tungstenite::{
     MaybeTlsStream, WebSocketStream,
     tungstenite::{Message as WsMessage, client::IntoClientRequest, protocol::WebSocketConfig},
 };
+use tracing::Instrument;
 use twitch_api::{
     TWITCH_EVENTSUB_WEBSOCKET_URL,
     eventsub::{
         self, Event, EventSubscription, Message, SessionData, Transport,
+        automod::settings,
         channel::{
             self, ChannelBanV1, ChannelCharityCampaignDonateV1, ChannelChatMessageV1,
             ChannelChatMessageV1Payload, ChannelUnbanV1,
@@ -35,11 +39,15 @@ use twitch_api::{
     types::{self, EventSubId, UserId},
 };
 
-use crate::rabbit::types::{RequestContract, TwitchSettingsChangeContract};
+use crate::{
+    TwitchClient,
+    api::PostRequest,
+    rabbit::types::{RequestContract, TwitchSettingsChangeContract},
+};
 
 /// Connect to the websocket and return the stream
 async fn connect(
-    request: &str,
+    request: impl AsRef<str>,
 ) -> Result<SplitStream<WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>>, eyre::Error> {
     let config = Some(WebSocketConfig {
         max_message_size: Some(64 << 20), // 64 MiB
@@ -47,13 +55,14 @@ async fn connect(
         accept_unmasked_frames: false,
         ..WebSocketConfig::default()
     });
-    let socket = tokio_tungstenite::connect_async_with_config(request, config, false)
+    let socket = tokio_tungstenite::connect_async_with_config(request.as_ref(), config, false)
         .await
         .context("Can't connect")?
         .0
         .split()
         .1;
 
+    tracing::debug!(url = request.as_ref(), "Created a websocket");
     Ok(socket)
 }
 
@@ -86,6 +95,7 @@ async fn subscribe(
     subscription: impl EventSubscription + Send,
 ) -> Result<()> {
     let transport: Transport = Transport::websocket(session_id);
+    tracing::trace!(?transport, "Created a transport");
     let _event_info: CreateEventSubSubscription<_> = helix_client
         .create_eventsub_subscription(subscription, transport, token)
         .await?;
@@ -115,41 +125,10 @@ async fn process_welcome(
     Ok(())
 }
 
-// fn process_payload(event: Event) -> Result<Action> {
-//     match event {
-//         Event::ChannelChatMessageV1(eventsub::Payload { message, .. }) => match message {
-//             Message::VerificationRequest(_) => unreachable!(),
-//             Message::Revocation() => bail!("Unexpected subscription revocation"),
-//             Message::Notification(e) => {
-//                 process_message(e)?;
-//                 Ok(Action::ResetKeepalive)
-//             }
-//             _ => todo!(),
-//         },
-//         _ => todo!(),
-//     }
-// }
-
-fn process_message(e: ChannelChatMessageV1Payload) -> Result<()> {
-    println!("Received message {:#?}", e.message.text);
-    Ok(())
-}
-
-fn get_bot_id() -> UserId {
+pub fn get_bot_id() -> UserId {
+    // TODO: Unhardcode this before deploying
     UserId::new("1396690985".to_string())
 }
-
-// /// action to perform on received message
-// enum Action {
-//     /// do nothing with the message
-//     Nothing,
-//     /// reset the timeout and keep the connection alive
-//     ResetKeepalive,
-//     /// kill predecessor and swap the handle
-//     KillPredecessor,
-//     /// spawn successor and await death signal
-//     AssignSuccessor(ActorHandle),
-// }
 
 pub trait WebsocketConnection {
     async fn receive_message(&mut self) -> Result<Option<String>>;
@@ -157,91 +136,132 @@ pub trait WebsocketConnection {
 
 pub struct InitialChatWebsocketConnection<'a> {
     pub token: Mutex<UserToken>,
-    pub chats: Vec<UserId>,
     pub client: HelixClient<'a, Client>,
     socket: SplitStream<WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>>,
 }
 
 pub struct ChatWebsocketConnection<'a> {
     token: Mutex<UserToken>,
+    /// Twitch UID -> subscription ID
     chats: HashMap<UserId, Option<EventSubId>>,
-    client: HelixClient<'a, Client>,
+    /// Twitch UID -> osu! ID
+    osu_users: HashMap<UserId, u32>,
+    client: TwitchClient<'a>,
     socket: SplitStream<WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>>,
     session_id: String,
-    twitch_settings_change_rx: UnboundedReceiver<TwitchSettingsChangeContract>,
-    request_tx: UnboundedSender<RequestContract>,
+    request_tx: UnboundedSender<PostRequest>,
+    done_subscribing: bool,
 }
 
+impl<'a> std::fmt::Debug for ChatWebsocketConnection<'a> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ChatWebsocketConnection")
+            .field("chats", &self.chats)
+            .field("socket", &self.socket)
+            .field("session_id", &self.session_id)
+            .field("request_tx", &self.request_tx)
+            .finish()
+    }
+}
+
+const BASE_WEBSOCKET_URL: &str = "wss://eventsub.wss.twitch.tv/ws";
 impl<'a> InitialChatWebsocketConnection<'a> {
-    pub async fn new(token: UserToken, chats: Vec<UserId>) -> Self {
+    #[tracing::instrument(skip_all)]
+    pub async fn new(token: UserToken) -> Self {
         // if the initial connection fails, the entire thing is likely unrecoverable
         let socket = connect("wss://eventsub.wss.twitch.tv/ws").await.unwrap();
+        tracing::trace!("Connected to base EventSub at {BASE_WEBSOCKET_URL}");
         let token = Mutex::new(token);
-        let client: HelixClient<'_, Client> = HelixClient::new();
+        let client: TwitchClient = HelixClient::new();
+        tracing::trace!("Successfully created a Twitch API client");
         Self {
             token,
-            chats,
             client,
-            socket: socket,
+            socket,
         }
     }
 
-    async fn create_full_client(mut self, frame: String) -> Result<ChatWebsocketConnection<'a>> {
-        let message = self.receive_message().await?;
-        if let Some(message) = message {
-            let event_data =
-                Event::parse_websocket(&frame).wrap_err("Faield to parse a Websocket frame")?;
-            match event_data {
-                EventsubWebsocketData::Welcome {
-                    payload: WelcomePayload { session },
-                    ..
-                } => ChatWebsocketConnection::new(self, session, todo!(), todo!()).await,
-                _ => todo!(),
+    pub async fn create_full_client(
+        self,
+        frame: String,
+        osu_tx: mpsc::UnboundedSender<PostRequest>,
+        user_id: HashMap<UserId, u32>,
+    ) -> Result<ChatWebsocketConnection<'a>> {
+        let event_data =
+            Event::parse_websocket(&frame).wrap_err("Failed to parse a Websocket frame")?;
+        tracing::trace!(?event_data, "Handling message for full client");
+        match event_data {
+            EventsubWebsocketData::Welcome {
+                payload: WelcomePayload { session },
+                ..
+            } => {
+                tracing::debug!("Received a Welcome message, creating a new client");
+                let token = Mutex::new(self.token.into_inner());
+                let client: HelixClient<'_, Client> = HelixClient::new();
+                return Ok(ChatWebsocketConnection {
+                    token,
+                    chats: user_id.keys().map(|c| (c.clone(), None)).collect(),
+                    osu_users: user_id,
+                    client,
+                    socket: self.socket,
+                    session_id: session.id.to_string(),
+                    request_tx: osu_tx,
+                    done_subscribing: false,
+                });
             }
-        } else {
-            Err(eyre::eyre!("Failed to receive a message"))
+            EventsubWebsocketData::Keepalive { metadata, payload } => {
+                tracing::trace!(
+                    ?metadata,
+                    "Received a Keepalive message before init is done"
+                );
+                bail!("Received a Keepalive");
+            }
+            _ => {
+                tracing::error!(?event_data, "Received an unexpected message, bailing");
+                bail!("Received an unexpected message");
+            }
         }
     }
 }
 
 impl<'a> ChatWebsocketConnection<'a> {
-    pub async fn new(
-        initial: InitialChatWebsocketConnection<'a>,
-        session: SessionData<'a>,
-        twitch_rx: UnboundedReceiver<TwitchSettingsChangeContract>,
-        request_tx: UnboundedSender<RequestContract>,
-    ) -> Result<Self> {
-        // if the initial connection fails, the entire thing is likely unrecoverable
-        let socket = connect(&session.reconnect_url.unwrap()).await.unwrap();
-        let token = Mutex::new(initial.token.into_inner());
-        let client: HelixClient<'_, Client> = HelixClient::new();
-        Ok(Self {
-            token,
-            chats: initial.chats.into_iter().map(|c| (c, None)).collect(),
-            client,
-            socket: socket,
-            session_id: session.id.to_string(),
-            twitch_settings_change_rx: twitch_rx,
-            request_tx,
-        })
-    }
-    async fn handle_message(&mut self, frame: String) -> Result<()> {
+    #[tracing::instrument(skip_all)]
+    pub async fn handle_message(&mut self, frame: String) -> Result<()> {
         let event = Event::parse_websocket(&frame).wrap_err("Failed to parse a Websocket frame")?;
         match event {
-            EventsubWebsocketData::Welcome { metadata, payload } => {
-                unimplemented!("This is hypothetically unreachable I think?")
+            EventsubWebsocketData::Welcome {
+                metadata: metadata,
+                payload: payload,
+            } => {
+                tracing::error!("Received an unexpected Welcome message");
+                Ok(())
             }
-            EventsubWebsocketData::Keepalive { metadata, payload } => Ok(()),
-            EventsubWebsocketData::Notification { metadata, payload } => {
+            EventsubWebsocketData::Keepalive {
+                metadata: _,
+                payload: _,
+            } => {
+                tracing::trace!("Received a KeepAlive heartbeat");
+                Ok(())
+            }
+            EventsubWebsocketData::Notification {
+                metadata: metadata,
+                payload,
+            } => {
+                tracing::trace!(
+                    notification_type = metadata.subscription_type.to_str(),
+                    "Received a notification"
+                );
                 self.handle_notification(payload).await
             }
             EventsubWebsocketData::Revocation { metadata, payload } => {
                 todo!("I'm not sure yet how to handle revocations")
             }
             EventsubWebsocketData::Reconnect { metadata, payload } => {
+                tracing::trace!("Received a reconnect event");
                 self.socket = connect(payload.session.reconnect_url.unwrap().as_ref())
                     .await
                     .wrap_err("Failed to reconnect to EventSub")?;
+                tracing::trace!("Reconnected to EventSub");
                 Ok(())
             }
             _ => todo!(),
@@ -249,27 +269,72 @@ impl<'a> ChatWebsocketConnection<'a> {
     }
     async fn handle_notification(&mut self, event: Event) -> Result<()> {
         match event {
-            Event::ChannelChatMessageV1(eventsub::Payload { message, .. }) => match message {
-                Message::VerificationRequest(_) => unreachable!(),
-                Message::Revocation() => bail!("Unexpected subscription revocation"),
-                Message::Notification(e) => {
-                    process_message(e)?;
-                    Ok(())
+            Event::ChannelChatMessageV1(eventsub::Payload { message, .. }) => {
+                tracing::trace!("Message is a channel.chat.message");
+                match message {
+                    Message::VerificationRequest(_) => unreachable!(
+                        "Verification requests shouldn't come through for WebSocket connections"
+                    ),
+                    Message::Revocation() => bail!("Unexpected subscription revocation"),
+                    Message::Notification(e) => self.process_chat_message(e).await,
+                    _ => todo!(),
                 }
-                _ => todo!(),
-            },
-            _ => todo!(),
+            }
+            _ => {
+                tracing::error!("Unexpected message type, bailing");
+                panic!("Unexpected message type");
+            }
         }
     }
 
     async fn process_chat_message(&mut self, payload: ChannelChatMessageV1Payload) -> Result<()> {
-        let request = construct_message_from_payload()?;
-        self.request_tx
-            .send(request)
-            .wrap_err("Failed to process chat message")
+        let osu_id = self
+            .osu_users
+            .get(&payload.broadcaster_user_id)
+            .ok_or_eyre("User not found");
+        let Ok(osu_id) = osu_id else {
+            tracing::trace!(?self.chats, "User not found");
+            return Ok(());
+        };
+        let request = self.construct_message_from_payload(*osu_id, payload);
+        match request {
+            Ok(Some(request)) => {
+                tracing::trace!("Constructed a valid request");
+                self.request_tx
+                    .send(request)
+                    .wrap_err("Failed to process chat message")
+            }
+            Ok(None) => {
+                tracing::trace!("Not a valid request");
+                Ok(())
+            }
+            Err(err) => {
+                tracing::error!(?err, "Failed to parse a message");
+                Err(err)
+            }
+        }
+    }
+    fn construct_message_from_payload(
+        &self,
+        osu_id: u32,
+        payload: ChannelChatMessageV1Payload,
+    ) -> Result<Option<PostRequest>> {
+        tracing::trace!(
+            from = %payload.broadcaster_user_name,
+            to = %payload.chatter_user_name,
+            message = payload.message.text,
+            "Creating a message");
+        if let Some(id) = get_osu_map_id(&payload.message.text) {
+            Ok(Some(PostRequest {
+                destination_id: osu_id,
+                beatmap_id: id,
+            }))
+        } else {
+            Ok(None)
+        }
     }
 
-    async fn process_settings_change(
+    pub async fn process_settings_change(
         &mut self,
         settings_change: TwitchSettingsChangeContract,
     ) -> Result<()> {
@@ -278,10 +343,14 @@ impl<'a> ChatWebsocketConnection<'a> {
                 // TODO: subscribe to channel, add eventsub ID to hashmap
                 let uid: UserId = settings_change.user_id.into();
                 let subscription = self.subscribe_to_channel(&uid).await?;
+                self.osu_users
+                    .entry(uid.clone())
+                    .and_modify(|v| *v = settings_change.osu_id)
+                    .or_insert(settings_change.osu_id);
                 self.chats
                     .entry(uid)
                     .and_modify(|v| *v = Some(subscription.clone().id))
-                    .or_insert(subscription.clone().id.into());
+                    .or_insert(Some(subscription.clone().id));
                 Ok(())
             }
             false => {
@@ -298,19 +367,50 @@ impl<'a> ChatWebsocketConnection<'a> {
             }
         }
     }
+    pub async fn subscribe_to_channels_initially(&mut self) -> Result<()> {
+        if self.done_subscribing {
+            tracing::warn!("Tried resubscribing again");
+            return Ok(());
+        }
+        tracing::trace!("Attempting to subscribe to multiple channels");
+        let ids = self.chats.clone();
+        let ids = ids.keys().clone();
+        let keys: Vec<_> = ids.collect();
+        tracing::trace!(?keys, "Subscribing");
+        for key in keys {
+            let subscription_result = self.subscribe_to_channel(key).await?;
+
+            tracing::trace!(
+                streamer_id = ?subscription_result.condition.broadcaster_user_id,
+                "Created new subscription"
+            )
+        }
+        self.done_subscribing = true;
+        Ok(())
+    }
     async fn subscribe_to_channel(
         &mut self,
         channel_id: &UserId,
     ) -> Result<CreateEventSubSubscription<ChannelChatMessageV1>> {
         let token = self.token.lock().await.clone();
-        self.client
+        let result = self
+            .client
             .create_eventsub_subscription(
                 ChannelChatMessageV1::new(channel_id.to_owned(), get_bot_id()),
                 Transport::websocket(&self.session_id),
                 &token,
             )
             .await
-            .wrap_err("Failed to subscribe to a channel")
+            .wrap_err("Failed to subscribe to a channel")?;
+        // TODO: this needs to propagate user IDs
+        let event_id = result.id.clone();
+        tracing::trace!(result = event_id.clone().as_str(), "Subscribed to user");
+        self.chats
+            .entry(channel_id.clone())
+            .and_modify(|v| *v = Some(event_id.clone()))
+            .or_insert(Some(event_id.clone()));
+        tracing::trace!(event_id = %event_id.clone(), "New event subscription ID");
+        Ok(result)
     }
     async fn unsubscribe_from_channel(&mut self, event_id: EventSubId) -> Result<()> {
         let token = self.token.lock().await;
@@ -321,12 +421,61 @@ impl<'a> ChatWebsocketConnection<'a> {
             .wrap_err("Failed to unsubscribe from a channel")
     }
 }
+macro_rules! define_regex {
+    ( $( $vis:vis $name:ident: $pat:literal; )* ) => {
+        $(
+            $vis static $name: std::sync::LazyLock<regex::Regex> =
+                std::sync::LazyLock::new(|| regex::Regex::new($pat).unwrap());
+        )*
+    }
+}
+define_regex! {
+    OSU_URL_MAP_NEW_MATCHER: r"https://osu\.ppy\.sh/beatmapsets/(\d+)(?:(?:/?#(?:osu|mania|taiko|fruits)|<#\d+>)/(\d+))?";
+    OSU_URL_MAP_OLD_MATCHER: r"https://osu\.ppy\.sh/b(?:eatmaps)?/(\d+)";
+}
+pub fn get_osu_map_id(msg: &str) -> Option<u32> {
+    if let Some(id) = msg.parse().ok().filter(|_| !msg.starts_with('+')) {
+        return Some(id);
+    }
 
-fn construct_message_from_payload() -> Result<RequestContract> {
-    todo!()
+    let matcher = if let Some(c) = OSU_URL_MAP_OLD_MATCHER.captures(msg) {
+        c.get(1)
+    } else {
+        OSU_URL_MAP_NEW_MATCHER.captures(msg).and_then(|c| c.get(2))
+    };
+
+    matcher.and_then(|c| c.as_str().parse().ok())
 }
 
 impl<'a> WebsocketConnection for InitialChatWebsocketConnection<'a> {
+    async fn receive_message(&mut self) -> Result<Option<String>> {
+        let Some(message) = self.socket.next().await else {
+            return Err(eyre::eyre!("websocket stream closed unexpectedly"));
+        };
+        match message.context("tungstenite error")? {
+            WsMessage::Close(frame) => {
+                let reason = frame.map(|frame| frame.reason).unwrap_or_default();
+                tracing::error!("Connection closed with reason: {reason}");
+                Err(eyre::eyre!(
+                    "websocket stream closed unexpectedly with reason {reason}"
+                ))
+            }
+            WsMessage::Frame(_) => unreachable!(),
+            WsMessage::Ping(_) | WsMessage::Pong(_) => {
+                // no need to do anything as tungstenite automatically handles pings for you
+                // but refresh the token just in case
+                refresh_if_expired(&self.token, &self.client).await;
+                Ok(None)
+            }
+            WsMessage::Binary(_) => unimplemented!(),
+            WsMessage::Text(payload) => {
+                tracing::trace!(%payload, "Received message");
+                Ok(Some(payload))
+            }
+        }
+    }
+}
+impl<'a> WebsocketConnection for ChatWebsocketConnection<'a> {
     async fn receive_message(&mut self) -> Result<Option<String>> {
         let Some(message) = self.socket.next().await else {
             return Err(eyre::eyre!("websocket stream closed unexpectedly"));
@@ -350,143 +499,3 @@ impl<'a> WebsocketConnection for InitialChatWebsocketConnection<'a> {
         }
     }
 }
-
-// struct WebSocketConnection {
-//     socket: SplitStream<WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>>,
-//     helix_client: HelixClient<'static, Client>,
-//     token: Arc<Mutex<UserToken>>,
-//     subscribed: Arc<AtomicBool>,
-//     user_id: Arc<types::UserId>,
-//     kill_self_tx: UnboundedSender<()>,
-//     twitch_settings_rx: UnboundedReceiver<TwitchSettingsChangeContract>,
-//     requests_tx: UnboundedSender<RequestContract>,
-// }
-// impl WebSocketConnection {
-//     async fn receive_message(&mut self) -> Result<Option<String>> {
-//         let Some(message) = self.socket.next().await else {
-//             return Err(eyre::eyre!("websocket stream closed unexpectedly"));
-//         };
-//         match message.context("tungstenite error")? {
-//             WsMessage::Close(frame) => {
-//                 let reason = frame.map(|frame| frame.reason).unwrap_or_default();
-//                 Err(eyre::eyre!(
-//                     "websocket stream closed unexpectedly with reason {reason}"
-//                 ))
-//             }
-//             WsMessage::Frame(_) => unreachable!(),
-//             WsMessage::Ping(_) | WsMessage::Pong(_) => {
-//                 // no need to do anything as tungstenite automatically handles pings for you
-//                 // but refresh the token just in case
-//                 refresh_if_expired(self.token.clone(), self.helix_client).await;
-//                 Ok(None)
-//             }
-//             WsMessage::Binary(_) => unimplemented!(),
-//             WsMessage::Text(payload) => Ok(Some(payload)),
-//         }
-//     }
-
-//     async fn process_message(&self, frame: String) -> Result<Action> {
-//         let event_data = Event::parse_websocket(&frame).context("parsing error")?;
-//         match event_data {
-//             EventsubWebsocketData::Welcome {
-//                 payload: WelcomePayload { session },
-//                 ..
-//             } => {
-//                 process_welcome(
-//                     &self.subscribed,
-//                     &self.token,
-//                     self.helix_client,
-//                     &self.user_id,
-//                     session,
-//                 )
-//                 .await?;
-//                 Ok(Action::KillPredecessor)
-//             }
-//             EventsubWebsocketData::Reconnect {
-//                 payload: ReconnectPayload { session },
-//                 ..
-//             } => {
-//                 let url: String = session.reconnect_url.unwrap().into_owned();
-//                 let successor = ActorHandle::spawn(
-//                     url,
-//                     self.helix_client,
-//                     self.kill_self_tx.clone(),
-//                     self.token.clone(),
-//                     self.subscribed.clone(),
-//                     self.user_id.clone(),
-//                 );
-//                 Ok(Action::AssignSuccessor(successor))
-//             }
-//             EventsubWebsocketData::Keepalive { .. } => Ok(Action::ResetKeepalive),
-//             EventsubWebsocketData::Revocation { metadata, .. } => {
-//                 eyre::bail!("got revocation: {metadata:?}")
-//             }
-//             EventsubWebsocketData::Notification { payload: event, .. } => process_payload(event),
-//             _ => Ok(Action::Nothing),
-//         }
-//     }
-// }
-
-// pub struct ActorHandle(JoinHandle<Result<ActorHandle>>);
-
-// impl ActorHandle {
-//     pub fn spawn(
-//         url: impl IntoClientRequest + Unpin + Send + 'static,
-//         helix_client: &'static HelixClient<'_, Client>,
-//         kill_predecessor_tx: UnboundedSender<()>,
-//         token: Arc<Mutex<UserToken>>,
-//         subscribed: Arc<AtomicBool>,
-//         user_id: Arc<types::UserId>,
-//     ) -> Self {
-//         Self(tokio::spawn(async move {
-//             let socket = connect(url).await?;
-//             // If we receive a reconnect message we want to spawn a new connection to twitch.
-//             // The already existing session should wait on the new session to receive a welcome message before being closed.
-//             // https://dev.twitch.tv/docs/eventsub/handling-websocket-events/#reconnect-message
-//             let (kill_self_tx, mut kill_self_rx) = mpsc::unbounded_channel::<()>();
-
-//             let mut connection = WebSocketConnection {
-//                 socket,
-//                 helix_client,
-//                 token,
-//                 subscribed,
-//                 user_id,
-//                 kill_self_tx,
-//             };
-
-//             /// default keepalive duration is 10 seconds
-//             const WINDOW: u64 = 10;
-//             let mut timeout: Instant = Instant::now() + Duration::from_secs(WINDOW);
-//             let mut successor: Option<Self> = None;
-
-//             loop {
-//                 tokio::select! {
-//                     biased;
-//                     result = kill_self_rx.recv() => {
-//                         result.unwrap();
-//                         let Some(successor) = successor else {
-//                             // can't receive death signal from successor if it isn't spawned yet
-//                             unreachable!();
-//                         };
-//                         return Ok(successor);
-//                     }
-//                     result = connection.receive_message() => if let Some(frame) = result? {
-//                         let side_effect = connection.process_message(frame).await?;
-//                         match side_effect {
-//                             Action::Nothing => {}
-//                             Action::ResetKeepalive => timeout = Instant::now() + Duration::from_secs(WINDOW),
-//                             Action::KillPredecessor => kill_predecessor_tx.send(())?,
-//                             Action::AssignSuccessor(actor_handle) => {
-//                                 successor = Some(actor_handle);
-//                             },
-//                         }
-//                     },
-//                 }
-//             }
-//         }))
-//     }
-
-//     pub async fn join(self) -> Result<Result<Self>, JoinError> {
-//         self.0.await
-//     }
-// }

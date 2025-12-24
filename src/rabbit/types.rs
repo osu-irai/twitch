@@ -11,6 +11,9 @@ pub struct TwitchSettingsChangeContract {
     /// Twitch user ID
     #[serde(rename = "twitchUserId")]
     pub user_id: String,
+    /// osu! user ID
+    #[serde(rename = "osuId")]
+    pub osu_id: u32,
     /// Current toggle of the integration.
     /// There might be cases when the message has the same value
     /// as the in-memory user
