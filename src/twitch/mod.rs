@@ -20,7 +20,10 @@ use tokio_tungstenite::{
     MaybeTlsStream, WebSocketStream,
     tungstenite::{Message as WsMessage, client::IntoClientRequest, protocol::WebSocketConfig},
 };
-use twitch_api::{HelixClient, twitch_oauth2::UserToken};
+use twitch_api::{
+    HelixClient,
+    twitch_oauth2::{AppAccessToken, UserToken},
+};
 use twitch_api::{
     eventsub::{
         self, Event, EventSubscription, Message, SessionData, Transport,
@@ -35,14 +38,16 @@ use twitch_api::{
 use crate::{
     api::PostRequest,
     rabbit::types::TwitchSettingsChangeContract,
-    twitch::websocket::{InitialChatWebsocketConnection, WebsocketConnection},
+    twitch::websocket::{
+        ChatWebsocketConnection, InitialChatWebsocketConnection, WebsocketConnection,
+    },
 };
 
 // use crate::twitch::websocket::ActorHandle;
 
 mod websocket;
 
-#[tracing::instrument]
+#[tracing::instrument(skip(token))]
 pub async fn run(
     // helix_client: &'static HelixClient<'_, Client>,
     token: UserToken,

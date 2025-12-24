@@ -1,49 +1,34 @@
 use eyre::{Context, OptionExt, Result, bail};
-use futures::{FutureExt, StreamExt, stream::SplitStream};
-use lapin::protocol::metadata;
+use futures::{StreamExt, stream::SplitStream};
 use reqwest::Client;
 use std::{
     collections::HashMap,
     panic,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::atomic::{AtomicBool, Ordering},
 };
 use tokio::{
     sync::{
         Mutex,
-        mpsc::{self, UnboundedReceiver, UnboundedSender},
+        mpsc::{self, UnboundedSender},
     },
-    task::{JoinError, JoinHandle},
-    time::{Duration, Instant},
+    time::Duration,
 };
 use tokio_tungstenite::{
     MaybeTlsStream, WebSocketStream,
-    tungstenite::{Message as WsMessage, client::IntoClientRequest, protocol::WebSocketConfig},
+    tungstenite::{Message as WsMessage, protocol::WebSocketConfig},
 };
-use tracing::Instrument;
 use twitch_api::{
-    TWITCH_EVENTSUB_WEBSOCKET_URL,
     eventsub::{
         self, Event, EventSubscription, Message, SessionData, Transport,
-        automod::settings,
-        channel::{
-            self, ChannelBanV1, ChannelCharityCampaignDonateV1, ChannelChatMessageV1,
-            ChannelChatMessageV1Payload, ChannelUnbanV1,
-        },
-        event::websocket::{EventsubWebsocketData, ReconnectPayload, WelcomePayload},
+        channel::{ChannelChatMessageV1, ChannelChatMessageV1Payload},
+        event::websocket::{EventsubWebsocketData, WelcomePayload},
     },
     helix::{HelixClient, eventsub::CreateEventSubSubscription},
-    twitch_oauth2::{self, ClientId, ClientSecret, RefreshToken, TwitchToken, UserToken},
+    twitch_oauth2::{ClientId, ClientSecret, TwitchToken, UserToken},
     types::{self, EventSubId, UserId},
 };
 
-use crate::{
-    TwitchClient,
-    api::PostRequest,
-    rabbit::types::{RequestContract, TwitchSettingsChangeContract},
-};
+use crate::{TwitchClient, api::PostRequest, rabbit::types::TwitchSettingsChangeContract};
 
 /// Connect to the websocket and return the stream
 async fn connect(
@@ -209,7 +194,10 @@ impl<'a> InitialChatWebsocketConnection<'a> {
                     done_subscribing: false,
                 });
             }
-            EventsubWebsocketData::Keepalive { metadata, payload } => {
+            EventsubWebsocketData::Keepalive {
+                metadata,
+                payload: _,
+            } => {
                 tracing::trace!(
                     ?metadata,
                     "Received a Keepalive message before init is done"
@@ -230,8 +218,8 @@ impl<'a> ChatWebsocketConnection<'a> {
         let event = Event::parse_websocket(&frame).wrap_err("Failed to parse a Websocket frame")?;
         match event {
             EventsubWebsocketData::Welcome {
-                metadata: metadata,
-                payload: payload,
+                metadata: _,
+                payload: _,
             } => {
                 tracing::error!("Received an unexpected Welcome message");
                 Ok(())
@@ -253,10 +241,16 @@ impl<'a> ChatWebsocketConnection<'a> {
                 );
                 self.handle_notification(payload).await
             }
-            EventsubWebsocketData::Revocation { metadata, payload } => {
+            EventsubWebsocketData::Revocation {
+                metadata: _,
+                payload: _,
+            } => {
                 todo!("I'm not sure yet how to handle revocations")
             }
-            EventsubWebsocketData::Reconnect { metadata, payload } => {
+            EventsubWebsocketData::Reconnect {
+                metadata: _,
+                payload,
+            } => {
                 tracing::trace!("Received a reconnect event");
                 self.socket = connect(payload.session.reconnect_url.unwrap().as_ref())
                     .await

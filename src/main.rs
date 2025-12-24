@@ -1,7 +1,7 @@
 use std::{collections::HashMap, fmt::Debug, sync::LazyLock};
 
 use eyre::Context as _;
-use reqwest::Client;
+use reqwest::{Client, Url};
 use tokio::sync::{broadcast, mpsc};
 use tracing::level_filters::LevelFilter;
 use tracing_subscriber::{
@@ -12,6 +12,7 @@ use tracing_subscriber::{
 };
 use twitch_api::{
     HelixClient, HttpClient,
+    helix::Scope,
     twitch_oauth2::{self, AccessToken, TwitchToken, UserToken},
     types::UserId,
 };
@@ -57,24 +58,38 @@ pub async fn run() -> eyre::Result<()> {
     let channel = rabbit::create_rmq_channel(&rmq_connection).await?;
 
     // let users: Vec<_> = get_twitch_users()?;
-    let client: &'static TwitchClient = LazyLock::force(&HELIX_CLIENT);
+    LazyLock::force(&HELIX_CLIENT);
     let access_token =
         std::env::var("TWITCH_BOT_ACCESS_TOKEN").map(twitch_oauth2::AccessToken::new)?;
 
     let refresh_token =
         std::env::var("TWITCH_BOT_REFRESH_TOKEN").map(twitch_oauth2::RefreshToken::new)?;
-
     let client_secret =
         std::env::var("TWITCH_BOT_CLIENT_SECRET").map(twitch_oauth2::ClientSecret::new)?;
     let client_id = std::env::var("TWITCH_BOT_CLIENT_ID").map(twitch_oauth2::ClientId::new)?;
+    let redirect_url = std::env::var("TWITCH_BOT_REDIRECT_URL")
+        .map(|arg| Url::parse(&arg).unwrap())
+        .unwrap();
 
-    let token = twitch_oauth2::UserToken::from_existing(
-        client.get_client(),
-        access_token,
-        refresh_token,
-        client_secret,
-    )
-    .await?;
+    let token = {
+        // These may be needed later
+        // let scopes = vec![
+        //     Scope::ChannelBot,
+        //     Scope::UserReadChat,
+        //     Scope::UserWriteChat,
+        //     Scope::UserBot,
+        // ];
+        let builder = UserToken::from_existing_or_refresh_token(
+            &*HELIX_CLIENT,
+            access_token,
+            refresh_token,
+            client_id,
+            client_secret,
+        )
+        .await?;
+        builder
+    };
+
     tracing::trace!("Created a user token");
 
     let user_id: HashMap<UserId, u32> =
@@ -83,11 +98,6 @@ pub async fn run() -> eyre::Result<()> {
     tracing::trace!("Initializing websocket");
     let _task = tokio::spawn(twitch::run(token, user_id, osu_tx, twitch_rx));
     let _recv = tokio::spawn(rabbit::run_publish(channel, osu_rx));
-    // let _recv = tokio::spawn(async move {
-    //     while let Some(message) = osu_rx.recv().await {
-    //         tracing::trace!(?message, "Received an osu message")
-    //     }
-    // });
-    let (res, join) = tokio::join!(_task, _recv);
+    let _res = tokio::join!(_task, _recv);
     Ok(())
 }
