@@ -1,46 +1,16 @@
-use eyre::{Context, bail, eyre};
-use futures::{StreamExt, stream::SplitStream};
-use reqwest::Client;
-use std::{
-    collections::HashMap,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
+use std::{collections::HashMap, sync::Arc};
+use tokio::sync::{
+    Mutex,
+    mpsc::{self},
 };
-use tokio::{
-    sync::{
-        Mutex,
-        mpsc::{self, UnboundedSender},
-    },
-    task::{JoinError, JoinHandle},
-    time::{Duration, Instant},
-};
-use tokio_tungstenite::{
-    MaybeTlsStream, WebSocketStream,
-    tungstenite::{Message as WsMessage, client::IntoClientRequest, protocol::WebSocketConfig},
-};
-use twitch_api::{
-    HelixClient,
-    twitch_oauth2::{AppAccessToken, UserToken},
-};
-use twitch_api::{
-    eventsub::{
-        self, Event, EventSubscription, Message, SessionData, Transport,
-        channel::{ChannelBanV1, ChannelChatMessageV1, ChannelUnbanV1},
-        event::websocket::{EventsubWebsocketData, ReconnectPayload, WelcomePayload},
-    },
-    helix::eventsub::CreateEventSubSubscription,
-    twitch_oauth2::{self, ClientId, ClientSecret, RefreshToken, TwitchToken},
-    types::{self, UserId},
-};
+use tracing::{Instrument, info_span};
+use twitch_api::twitch_oauth2::UserToken;
+use twitch_api::types::{self};
 
 use crate::{
     api::PostRequest,
     rabbit::types::TwitchSettingsChangeContract,
-    twitch::websocket::{
-        ChatWebsocketConnection, InitialChatWebsocketConnection, WebsocketConnection,
-    },
+    twitch::websocket::{InitialChatWebsocketConnection, WebsocketConnection},
 };
 
 // use crate::twitch::websocket::ActorHandle;
@@ -57,23 +27,28 @@ pub async fn run(
 ) -> eyre::Result<()> {
     let mut initial_conn = InitialChatWebsocketConnection::new(token).await;
     tracing::debug!("Created initial websocket connection");
-    let mut new_conn = Err(eyre!("Failed to create a client"));
-    while let Ok(message) = initial_conn.receive_message().await {
-        match message {
-            Some(frame) => {
-                tracing::trace!("Creating a full client");
-                new_conn = initial_conn
+    let span = info_span!("connection creation");
+    let new_conn = loop {
+        match initial_conn.receive_message().await {
+            Ok(Some(frame)) => {
+                tracing::trace!(parent: &span, "Creating a full client");
+                let client = initial_conn
                     .create_full_client(frame, osu_tx, user_id)
+                    .instrument(span.clone())
                     .await;
-                tracing::debug!(?new_conn, "Created a long-term connection");
-                break;
+                break client;
             }
-            None => {
-                tracing::error!("Failed to create a new connection, retrying");
+            Ok(None) => {
+                tracing::warn!(parent: &span, "Failed to create a new connection, retrying");
+            }
+            Err(e) => {
+                tracing::error!(parent: &span, "Error receiving message: {e}");
+                break Err(e.into());
             }
         }
-    }
-    let new_conn = Arc::new(Mutex::new(new_conn?));
+    }?;
+    tracing::debug!(parent: &span, ?new_conn, "Created a long-term connection");
+    let new_conn = Arc::new(Mutex::new(new_conn));
     let conn_clone = Arc::clone(&new_conn);
     tracing::trace!("Starting a receive task");
     let a = tokio::spawn(async move {
