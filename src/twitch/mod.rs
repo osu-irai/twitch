@@ -17,9 +17,9 @@ use crate::{
 
 mod websocket;
 
+/// Initialize Twitch connections
 #[tracing::instrument(skip(token))]
 pub async fn run(
-    // helix_client: &'static HelixClient<'_, Client>,
     token: UserToken,
     user_id: HashMap<types::UserId, u32>,
     osu_tx: mpsc::UnboundedSender<PostRequest>,
@@ -27,6 +27,7 @@ pub async fn run(
 ) -> eyre::Result<()> {
     let mut initial_conn = InitialChatWebsocketConnection::new(token).await;
     tracing::debug!("Created initial websocket connection");
+
     let span = info_span!("connection creation");
     let new_conn = loop {
         match initial_conn.receive_message().await {
@@ -49,9 +50,10 @@ pub async fn run(
     }?;
     tracing::debug!(parent: &span, ?new_conn, "Created a long-term connection");
     let new_conn = Arc::new(Mutex::new(new_conn));
+
     let conn_clone = Arc::clone(&new_conn);
     tracing::trace!("Starting a receive task");
-    let a = tokio::spawn(async move {
+    let message_task = tokio::spawn(async move {
         tracing::trace!("Starting a message reception loop");
         let mut lock = conn_clone.lock().await;
         lock.subscribe_to_channels_initially().await.unwrap();
@@ -76,9 +78,10 @@ pub async fn run(
             }
         }
     });
+
     let conn_clone = Arc::clone(&new_conn);
     tracing::trace!("Starting a setting change tracking task");
-    let b = tokio::spawn(async move {
+    let settings_task = tokio::spawn(async move {
         while let Some(message) = twitch_rx.recv().await {
             tracing::trace!(?message, "Changing user settings");
             conn_clone
@@ -89,7 +92,7 @@ pub async fn run(
                 .unwrap();
         }
     });
-    let _ = tokio::join!(a, b);
+    let _ = tokio::join!(message_task, settings_task);
     tracing::trace!("Returning from twitch tasks");
     Ok(())
 }

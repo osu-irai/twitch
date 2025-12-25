@@ -1,26 +1,20 @@
-use std::{collections::HashMap, fmt::Debug, sync::LazyLock};
+use std::{collections::HashMap, sync::LazyLock};
 
 use eyre::Context as _;
 use reqwest::{Client, Url};
-use tokio::sync::{broadcast, mpsc};
-use tracing::level_filters::LevelFilter;
+use tokio::sync::mpsc;
 use tracing_subscriber::{
-    EnvFilter, filter,
-    fmt::{self, Formatter},
-    layer::SubscriberExt,
+    EnvFilter,
+    fmt::{self},
     util::SubscriberInitExt,
 };
 use twitch_api::{
-    HelixClient, HttpClient,
-    helix::Scope,
-    twitch_oauth2::{self, AccessToken, TwitchToken, UserToken},
+    HelixClient,
+    twitch_oauth2::{self, UserToken},
     types::UserId,
 };
 
-use crate::{
-    api::{PostRequest, get_twitch_users},
-    rabbit::types::TwitchSettingsChangeContract,
-};
+use crate::api::PostRequest;
 
 pub mod api;
 pub mod rabbit;
@@ -48,13 +42,14 @@ pub async fn run() -> eyre::Result<()> {
         .with_env_filter(EnvFilter::from_default_env())
         .event_format(format)
         .init();
-    tracing::trace!("Initializing");
-    let rmq_connection = rabbit::create_rmq_connection().await?;
-    let (twitch_tx, mut twitch_rx) = mpsc::unbounded_channel();
-    let consumer = rabbit::setup_twitch_settings_queue(&rmq_connection).await?;
-    tokio::spawn(async move { rabbit::run_twitch_queue(twitch_tx, consumer) });
+    tracing::debug!("Initializing");
 
-    let (osu_tx, mut osu_rx) = mpsc::unbounded_channel::<PostRequest>();
+    let rmq_connection = rabbit::create_rmq_connection().await?;
+    let (twitch_tx, twitch_rx) = mpsc::unbounded_channel();
+    let consumer = rabbit::setup_twitch_settings_queue(&rmq_connection).await?;
+    let _queue_task = tokio::spawn(async move { rabbit::run_twitch_queue(twitch_tx, consumer) });
+
+    let (osu_tx, osu_rx) = mpsc::unbounded_channel::<PostRequest>();
     let channel = rabbit::create_rmq_channel(&rmq_connection).await?;
 
     // let users: Vec<_> = get_twitch_users()?;
@@ -96,8 +91,8 @@ pub async fn run() -> eyre::Result<()> {
         HashMap::from([(UserId::new("129898402".to_string()), 11482346)]);
 
     tracing::trace!("Initializing websocket");
-    let _task = tokio::spawn(twitch::run(token, user_id, osu_tx, twitch_rx));
-    let _recv = tokio::spawn(rabbit::run_publish(channel, osu_rx));
-    let _res = tokio::join!(_task, _recv);
+    let _twitch_task = tokio::spawn(twitch::run(token, user_id, osu_tx, twitch_rx));
+    let _publish_task = tokio::spawn(rabbit::run_publish(channel, osu_rx));
+    let _res = tokio::join!(_queue_task, _twitch_task, _publish_task);
     Ok(())
 }

@@ -51,68 +51,26 @@ async fn connect(
     Ok(socket)
 }
 
+/// Check expiration time for UserToken and refresh if necessary
+#[tracing::instrument(skip_all)]
 async fn refresh_if_expired(token: &Mutex<UserToken>, helix_client: &HelixClient<'_, Client>) {
     let mut lock = token.lock().await;
 
     if lock.expires_in() >= Duration::from_secs(60) {
+        tracing::trace!(expires_in = ?lock.expires_in(), "Token has not expired yet");
         return;
     }
 
     let client = helix_client.get_client();
-
     let _ = lock.refresh_token(client).await;
+    tracing::debug!("Refreshed user token");
+
     drop(lock);
 }
 
-fn get_client_id_from_env() -> Result<ClientId, std::env::VarError> {
-    Ok(ClientId::from(std::env::var("TWITCH_BOT_CLIENT_ID")?))
-}
-
-fn get_client_secret_from_env() -> Result<ClientSecret, std::env::VarError> {
-    Ok(ClientSecret::from(std::env::var(
-        "TWITCH_BOT_CLIENT_SECRET",
-    )?))
-}
-async fn subscribe(
-    helix_client: &HelixClient<'_, Client>,
-    session_id: String,
-    token: &UserToken,
-    subscription: impl EventSubscription + Send,
-) -> Result<()> {
-    let transport: Transport = Transport::websocket(session_id);
-    tracing::trace!(?transport, "Created a transport");
-    let _event_info: CreateEventSubSubscription<_> = helix_client
-        .create_eventsub_subscription(subscription, transport, token)
-        .await?;
-    Ok(())
-}
-
-async fn process_welcome(
-    subscribed: &AtomicBool,
-    token: &Mutex<UserToken>,
-    helix_client: &HelixClient<'_, Client>,
-    user_id: &types::UserId,
-    session: SessionData<'_>,
-) -> Result<()> {
-    if subscribed.load(std::sync::atomic::Ordering::Relaxed) {
-        return Ok(());
-    }
-    println!("Processing welcome");
-    let user_token = token.lock().await;
-    subscribe(
-        helix_client,
-        session.id.to_string(),
-        &user_token,
-        ChannelChatMessageV1::new(user_id.clone(), get_bot_id()),
-    )
-    .await?;
-    subscribed.store(true, Ordering::Relaxed);
-    Ok(())
-}
-
 pub fn get_bot_id() -> UserId {
-    // TODO: Unhardcode this before deploying
-    UserId::new("1396690985".to_string())
+    // this *might* be worth moving to compile time but idk
+    UserId::new(std::env::var("TWITCH_BOT_CLIENT_USER").unwrap())
 }
 
 pub trait WebsocketConnection {
@@ -126,6 +84,7 @@ pub struct InitialChatWebsocketConnection<'a> {
 }
 
 pub struct ChatWebsocketConnection<'a> {
+    /// UserToken behind a Mutex to avoid task overlap issues
     token: Mutex<UserToken>,
     /// Twitch UID -> subscription ID
     chats: HashMap<UserId, Option<EventSubId>>,
@@ -133,11 +92,12 @@ pub struct ChatWebsocketConnection<'a> {
     osu_users: HashMap<UserId, u32>,
     client: TwitchClient<'a>,
     socket: SplitStream<WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>>,
+    /// EventSub session ID, mostly necessary for adding subs
     session_id: String,
     request_tx: UnboundedSender<PostRequest>,
-    done_subscribing: bool,
 }
 
+// Has to be manual due to HelixClient not deriving Debug
 impl<'a> std::fmt::Debug for ChatWebsocketConnection<'a> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ChatWebsocketConnection")
@@ -158,7 +118,8 @@ impl<'a> InitialChatWebsocketConnection<'a> {
         tracing::trace!("Connected to base EventSub at {BASE_WEBSOCKET_URL}");
         let token = Mutex::new(token);
         let client: TwitchClient = HelixClient::new();
-        tracing::trace!("Successfully created a Twitch API client");
+
+        tracing::debug!("Successfully created a Twitch API client");
         Self {
             token,
             client,
@@ -166,6 +127,7 @@ impl<'a> InitialChatWebsocketConnection<'a> {
         }
     }
 
+    /// Creates a ChatWebsocketConnection on successful Welcome message
     pub async fn create_full_client(
         self,
         frame: String,
@@ -183,7 +145,8 @@ impl<'a> InitialChatWebsocketConnection<'a> {
                 tracing::debug!("Received a Welcome message, creating a new client");
                 let token = Mutex::new(self.token.into_inner());
                 let client: HelixClient<'_, Client> = HelixClient::new();
-                return Ok(ChatWebsocketConnection {
+
+                Ok(ChatWebsocketConnection {
                     token,
                     chats: user_id.keys().map(|c| (c.clone(), None)).collect(),
                     osu_users: user_id,
@@ -191,8 +154,7 @@ impl<'a> InitialChatWebsocketConnection<'a> {
                     socket: self.socket,
                     session_id: session.id.to_string(),
                     request_tx: osu_tx,
-                    done_subscribing: false,
-                });
+                })
             }
             EventsubWebsocketData::Keepalive {
                 metadata,
@@ -231,11 +193,8 @@ impl<'a> ChatWebsocketConnection<'a> {
                 tracing::trace!("Received a KeepAlive heartbeat");
                 Ok(())
             }
-            EventsubWebsocketData::Notification {
-                metadata: metadata,
-                payload,
-            } => {
-                tracing::trace!(
+            EventsubWebsocketData::Notification { metadata, payload } => {
+                tracing::debug!(
                     notification_type = metadata.subscription_type.to_str(),
                     "Received a notification"
                 );
@@ -261,10 +220,13 @@ impl<'a> ChatWebsocketConnection<'a> {
             _ => todo!(),
         }
     }
+
+    /// Handles a notification event. Until further notice, only needs to handle channel.chat.message
     async fn handle_notification(&mut self, event: Event) -> Result<()> {
         match event {
             Event::ChannelChatMessageV1(eventsub::Payload { message, .. }) => {
                 tracing::trace!("Message is a channel.chat.message");
+
                 match message {
                     Message::VerificationRequest(_) => unreachable!(
                         "Verification requests shouldn't come through for WebSocket connections"
@@ -281,6 +243,7 @@ impl<'a> ChatWebsocketConnection<'a> {
         }
     }
 
+    /// Processes message data. Primarily parses and sends a beatmap if found
     async fn process_chat_message(&mut self, payload: ChannelChatMessageV1Payload) -> Result<()> {
         let osu_id = self
             .osu_users
@@ -290,10 +253,15 @@ impl<'a> ChatWebsocketConnection<'a> {
             tracing::trace!(?self.chats, "User not found");
             return Ok(());
         };
+        tracing::trace!(
+            target_id = osu_id,
+            "User is logged in, processing a message"
+        );
+
         let request = self.construct_message_from_payload(*osu_id, payload);
         match request {
             Ok(Some(request)) => {
-                tracing::trace!("Constructed a valid request");
+                tracing::debug!(?request, "Constructed a valid request");
                 self.request_tx
                     .send(request)
                     .wrap_err("Failed to process chat message")
@@ -308,17 +276,21 @@ impl<'a> ChatWebsocketConnection<'a> {
             }
         }
     }
+
+    /// Attempt to parse a beatmap ID from a Twitch message
     fn construct_message_from_payload(
         &self,
         osu_id: u32,
         payload: ChannelChatMessageV1Payload,
     ) -> Result<Option<PostRequest>> {
         tracing::trace!(
-            from = %payload.broadcaster_user_name,
-            to = %payload.chatter_user_name,
+            from = %payload.chatter_user_name,
+            to = %payload.broadcaster_user_name,
             message = payload.message.text,
-            "Creating a message");
+            "Parsing a message");
+
         if let Some(id) = get_osu_map_id(&payload.message.text) {
+            tracing::trace!(beatmap_id = id, "Found a valid beatmap ID");
             Ok(Some(PostRequest {
                 destination_id: osu_id,
                 beatmap_id: id,
@@ -328,15 +300,22 @@ impl<'a> ChatWebsocketConnection<'a> {
         }
     }
 
+    /// Add or remove user based on settings_change
     pub async fn process_settings_change(
         &mut self,
         settings_change: TwitchSettingsChangeContract,
     ) -> Result<()> {
+        tracing::trace!(?settings_change, "Processing a settings change");
         match settings_change.is_enabled {
             true => {
-                // TODO: subscribe to channel, add eventsub ID to hashmap
+                // subscribe to channel, add eventsub ID to hashmap
                 let uid: UserId = settings_change.user_id.into();
                 let subscription = self.subscribe_to_channel(&uid).await?;
+                tracing::debug!(
+                    user_id = %uid,
+                    user_subscription = %subscription.id,
+                    "Subscribing to user"
+                );
                 self.osu_users
                     .entry(uid.clone())
                     .and_modify(|v| *v = settings_change.osu_id)
@@ -348,40 +327,43 @@ impl<'a> ChatWebsocketConnection<'a> {
                 Ok(())
             }
             false => {
-                // TODO: delete subscription by ID, drop both ID and username from hashmap
-                let id = self.chats.remove::<UserId>(&settings_change.user_id.into());
+                // delete subscription by ID, drop both ID and username from hashmap
+                let id = self
+                    .chats
+                    .remove::<UserId>(&settings_change.user_id.clone().into());
                 match id {
                     Some(Some(id)) => {
-                        self.unsubscribe_from_channel(id).await;
+                        tracing::debug!(user_id = %&settings_change.user_id, user_subscription = %id, "Unsubscribing from user");
+                        let _ = self.unsubscribe_from_channel(id).await;
                     }
-                    Some(None) => println!("Weren't subscribed to the channel"),
-                    None => println!("I think you weren't even allowed to be here?"),
+                    Some(None) => tracing::warn!("Weren't subscribed to the channel"),
+                    None => tracing::warn!("I think you weren't even allowed to be here?"),
                 }
                 Ok(())
             }
         }
     }
+
+    /// Subscribe to a list of channels obtained from the API. Placeholder as this should be handler better
     pub async fn subscribe_to_channels_initially(&mut self) -> Result<()> {
-        if self.done_subscribing {
-            tracing::warn!("Tried resubscribing again");
-            return Ok(());
-        }
         tracing::trace!("Attempting to subscribe to multiple channels");
         let ids = self.chats.clone();
         let ids = ids.keys().clone();
         let keys: Vec<_> = ids.collect();
+
         tracing::trace!(?keys, "Subscribing");
         for key in keys {
             let subscription_result = self.subscribe_to_channel(key).await?;
 
-            tracing::trace!(
+            tracing::debug!(
                 streamer_id = ?subscription_result.condition.broadcaster_user_id,
                 "Created new subscription"
             )
         }
-        self.done_subscribing = true;
         Ok(())
     }
+
+    /// Create an EventSub subscription to a channel
     async fn subscribe_to_channel(
         &mut self,
         channel_id: &UserId,
@@ -398,7 +380,8 @@ impl<'a> ChatWebsocketConnection<'a> {
             .wrap_err("Failed to subscribe to a channel")?;
         // TODO: this needs to propagate user IDs
         let event_id = result.id.clone();
-        tracing::trace!(result = event_id.clone().as_str(), "Subscribed to user");
+        tracing::debug!(user_id = ?channel_id, "Subscribed to user");
+
         self.chats
             .entry(channel_id.clone())
             .and_modify(|v| *v = Some(event_id.clone()))
@@ -406,6 +389,8 @@ impl<'a> ChatWebsocketConnection<'a> {
         tracing::trace!(event_id = %event_id.clone(), "New event subscription ID");
         Ok(result)
     }
+
+    /// Remove an EventSub subscription by its ID
     async fn unsubscribe_from_channel(&mut self, event_id: EventSubId) -> Result<()> {
         let token = self.token.lock().await;
         self.client
