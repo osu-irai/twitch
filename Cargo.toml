@@ -18,3 +18,4 @@ lapin = "3.7.2"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
 regex = "1.12.2"
+apply = "0.3.0"

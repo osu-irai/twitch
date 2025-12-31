@@ -95,6 +95,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "apply"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f47b57fc4521e3cae26a4d45b5227f8fadee4c345be0fefd8d5d1711afb8aeb9"
+
+[[package]]
 name = "asn1-rs"
 version = "0.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2517,6 +2523,7 @@ dependencies = [
 name = "twitch"
 version = "0.1.0"
 dependencies = [
+ "apply",
  "dotenvy",
  "eyre",
  "futures",
